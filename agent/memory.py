@@ -5,11 +5,15 @@ from datetime import datetime
 from typing import Dict, List, Optional
 import requests
 
+# Set this before instantiating StrictMemoryManager to route all output into a subdirectory.
+# e.g.  import memory; memory._RUN_ID = "gemini"
+_RUN_ID: str = ""
+
 
 class StrictMemoryManager:
     def __init__(self):
-        self.data_dir = "save_data"
-        self.eval_dir = "eval_data"
+        self.data_dir = os.path.join("save_data", _RUN_ID) if _RUN_ID else "save_data"
+        self.eval_dir = os.path.join("eval_data", _RUN_ID) if _RUN_ID else "eval_data"
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.eval_dir, exist_ok=True)
         self._config = self._load_config()
@@ -92,7 +96,8 @@ class StrictMemoryManager:
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.truncate()
                 return session_num
-            raise ValueError(f"会话{session_num}已存在")
+            # Session already exists — return existing num for resume support
+            return session_num
             
     def add_dialog(self, patient_id: str, session_num: int, role: str, content: str) -> bool:
         filepath = os.path.join(self.data_dir, f"{patient_id}.json")
@@ -106,6 +111,7 @@ class StrictMemoryManager:
             
                 f.seek(0)
                 json.dump(data, f, ensure_ascii=False, indent=2)
+                f.truncate()
                 return True
             return False
 
@@ -114,7 +120,7 @@ class StrictMemoryManager:
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                session_data = data.get(f"session_{session_num}", {})
+                session_data = data.get("sessions", {}).get(f"session_{session_num}", {})
                 return {
                     'therapy': session_data.get('therapy', ''),
                     'dialogs': session_data.get('dialogs', [])
@@ -130,6 +136,9 @@ class StrictMemoryManager:
 
     def get_full_record(self, patient_id: str) -> Dict:
         filepath = os.path.join(self.data_dir, f"{patient_id}.json")
+        
+        if not os.path.exists(filepath):
+            return {}
 
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)

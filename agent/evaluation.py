@@ -14,8 +14,9 @@ client = OpenAI(
 
 
 class TherapistEvaluator:
-    def __init__(self, memory_manager: StrictMemoryManager):
+    def __init__(self, memory_manager: StrictMemoryManager, cost_tracker=None):
         self.memory_manager = memory_manager
+        self.cost_tracker = cost_tracker
         self._last_session_memory: Optional[Dict] = None  
         self._all_sessions_memory: Optional[List[Dict]] = None
         self._strategy_counter = {}  
@@ -32,29 +33,44 @@ class TherapistEvaluator:
  
     def _parse_openai_response(self, response) -> Any:
         if isinstance(response, str):
-            if response.startswith('{') and response.endswith('}'):
-                return json.loads(response)
             return response
             
         if hasattr(response, 'choices') and response.choices:
-            content = response.choices[0].message.content.strip()
-            if content.startswith('{') and content.endswith('}'):
-                return json.loads(content)
-            return content
-        return None
+            return response.choices[0].message.content.strip()
+        return ""
 
 
-    def _call_openai_api(self, prompt: str, max_tokens: int = 200, temperature: float = 0.7) -> Any:
+    def _call_openai_api(self, prompt: str, max_tokens: int = 200, temperature: float = None, module_name: str = "Evaluator") -> Any:
+        eval_config = config.get("api_config", {}).get("profiles", {}).get("evaluation", {"temperature": 0.3, "top_p": 0.75})
+        
+        # Use provided temperature or fallback to config
+        use_temp = temperature if temperature is not None else eval_config.get("temperature", 0.3)
+        use_top_p = eval_config.get("top_p", 0.75)
+        model_name = config["api_config"]["openai"]["model"]
+        
         completion = client.chat.completions.create(
-            model="Pro/deepseek-ai/DeepSeek-V3",
+            model=model_name,
             messages=[
                 {"role": "system", "content": "You are a professional psychological counselor."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=temperature,
+            temperature=use_temp,
+            top_p=use_top_p,
             max_tokens=max_tokens
         )
-        return self._parse_openai_response(completion)
+        
+        response_text = self._parse_openai_response(completion)
+        
+        if self.cost_tracker and completion.usage:
+            self.cost_tracker.record_call(
+                agent_name=module_name,
+                prompt=prompt,
+                response_text=response_text,
+                usage_metadata=completion.usage.dict(),
+                model_name=model_name
+            )
+            
+        return response_text
   
     def _get_session_strategy_memory(self, patient_id: str) -> str:
         if not patient_id:
@@ -174,7 +190,7 @@ Directly output a Boolean value True or False.
 """
         
 
-        response = self._call_openai_api(prompt, max_tokens=5, temperature=0.0)
+        response = self._call_openai_api(prompt, max_tokens=5, temperature=0.3, module_name="TherapistEvaluator.is_rejecting")
         if isinstance(response, str):
             return response.lower() == "true"
         return False
@@ -200,7 +216,7 @@ Return your answer strictly in JSON format, like this:
 }}
 """
     
-        response = self._call_openai_api(prompt, max_tokens=50, temperature=0.3)
+        response = self._call_openai_api(prompt, max_tokens=50, temperature=0.3, module_name="TherapistEvaluator.assess_emotion")
         cleaned_response = re.sub(r'^\s*```(json)?|```\s*$', '', response, flags=re.IGNORECASE).strip()
         return json.loads(cleaned_response)
 
@@ -227,23 +243,26 @@ Choose only one response strategy and provide the psychological counselor a resp
   - whether the patient is rejecting or deviate from the topic: {"Yes" if is_rejecting else "No"}
 *Rules:
   Determine the patient's current attitude first and then choose a suitable strategy based on the information above. The attitude you judged must be strictly positive or negative.
-  * If patient attitude is "positive", then you can only strictly choose one suitable strategy from options A to D. 
-  * If patient attitude is "negative", then you can only strictly choose one suitable strategy from options E to I.
+  * If patient attitude is "positive", then you can only strictly choose one suitable strategy from options A to G. 
+  * If patient attitude is "negative", then you can only strictly choose one suitable strategy from options H to O.
   [Below are the options]: 
-    A. Interpretation (The counselor conducts in-depth analysis and explanation of the patient's words and actions, helping the patient view problems from different perspectives.)
-    B. Confrontation (The counselor directly points out the patient's unreasonable ideas, contradictory behaviors, or potential problems, prompting the patient to face reality.)
-    C. Invite to Take New Perspectives (The counselor guides clients to view problems from different perspectives and broaden their thinking.)
-    D. Invite to Explore New Actions (The counselor encourages the patient to try new behaviors or methods to solve problems and drive the patient to take positive actions.) 
-    E. Restatement (The counselor repeats what the patient says to confirm their understanding and also makes the client feel cared for.)
-    F. Reflection of Feelings (The counselor identifies and expresses patient's emotions, helping the patient better understand and accept his own feelings.)
-    G. Self-disclosure (The counselor shares own similar experiences or feelings to establish resonance and trust with the patient.)
-    H. Inquiring Subjective Information (The counselor asks the patient for subjective information such as thoughts, feelings, and expectations to gain a deeper understanding of the patient's inner world.)
-    I. Inquiring Objective Information (The counselor inquires about specific facts, data, and other objective information to gain a more accurate understanding of the patient's situation.)
-    G. Affirmation and Reassurance (The counselor provides affirmation and comforts to the patient's thoughts, feelings, or behaviors, enhancing the patient's confidence and sense of security.)
-    H. Minimal Encouragement (The counselor encourages the patient to continue expressing thoughts and feelings, through simple language or body movements.)
-    I. Answer (The counselor provides direct answers to the patient's questions and offers the information or advice the patient need.)
+    A. Meta-Reflection (Reflect internal conflicts, ambivalence, or multiple parts to increase self-awareness, e.g., 'one part of you..., another part...')
+    B. Cognitive Reframing (Gently challenge or reframe unhelpful beliefs or interpretations while preserving the client’s sense of identity.)
+    C. Confrontation (Carefully point out discrepancies or contradictions in the client’s thoughts, emotions, or behaviors to promote insight and change.)
+    D. Behavioral Experiment (Encourage the client to engage in specific actions framed as experiments to test beliefs and generate new evidence.)
+    E. Pattern Reflection (Highlight connections between thoughts, emotions, and behaviors to make implicit patterns explicit.)
+    F. Goal Exploration (Clarify the client’s desired outcomes, values, or direction to guide the therapeutic process.)
+    G. Homework Suggestion (Propose concrete tasks or practices to be completed outside the session to support ongoing progress.)
+    H. Reflection (Reflect the client’s content, emotions, or underlying meaning to demonstrate understanding and deepen processing.)
+    I. Validation (Acknowledge and normalize the client’s emotional experience to reduce distress and build safety.)
+    J. Exploratory Question (Ask open-ended questions to gather new information and better understand the client’s situation, thoughts, or feelings.)
+    K. Hypothesis-Testing Question (Pose tentative, theory-driven questions to test emerging patterns or beliefs without imposing interpretation.)
+    L. Affirmation (Reinforce the client’s strengths, efforts, or positive shifts to build confidence and self-efficacy.)
+    M. Psychoeducation (Provide structured explanations or conceptual information to help the client understand their experiences or patterns.)
+    N. Session Summary (Summarize key insights, progress, and next steps to consolidate learning and provide closure.)
+    O. Answer (Provide direct information or guidance when the client explicitly asks or when clarification is necessary.)
   [Notice]:
-  Only return the strategy name of your selected option. For example, if you choose "A. Interpretation", then just return "Interpretation".
+  Only return the strategy name of your selected option. For example, if you choose "A. Meta-Reflection", then just return "Meta-Reflection".
 2.Based on your strategy, generate a concise corresponding response strategy text of no more than 30 words to precisely guide the psychological counselor's response as "strategy_text".
 3.Make strategies more diverse, don't always stick to a single strategy.
   In this session, you have used the following strategies: {session_strategy_memory}. Please try different strategies as much as possible as long as they are reasonable. 
@@ -256,7 +275,7 @@ Return your answer strictly in JSON format, like this:
 }}
 """ 
 
-        response = self._call_openai_api(prompt, max_tokens=100, temperature=0.5)
+        response = self._call_openai_api(prompt, max_tokens=100, module_name="TherapistEvaluator.update_strategy")
         cleaned_response = re.sub(r'^\s*```(json)?|```\s*$', '', response, flags=re.IGNORECASE).strip()
         
         return json.loads(cleaned_response)
@@ -288,7 +307,7 @@ Return your answer strictly in JSON format, like this:
 }}
 """
 
-        response = self._call_openai_api(prompt, max_tokens=150, temperature=0.3)
+        response = self._call_openai_api(prompt, max_tokens=150, temperature=0.3, module_name="TherapistEvaluator.evaluate_progress")
         cleaned_response = re.sub(r'^\s*```(json)?|```\s*$', '', response, flags=re.IGNORECASE).strip()
         
         return json.loads(cleaned_response)
@@ -312,7 +331,7 @@ Integrate your analysis into a fluent paragraph, without giving it in segments o
 Directly output your analysis content. Do not provide any explanation.
 """
 
-        response = self._call_openai_api(prompt, max_tokens=120, temperature=0.3)
+        response = self._call_openai_api(prompt, max_tokens=120, temperature=0.3, module_name="TherapistEvaluator.determine_stage")
         return response if response else "Cannot determine the current treatment stage"
     
 
@@ -329,7 +348,7 @@ It can be a single therapy or a reasonable combination therapy. Just use ' + ' t
 Please directly output the professional terminology of the therapy name without explanation or additional text.
 """
 
-        response = self._call_openai_api(prompt, max_tokens=40, temperature=0.3)
+        response = self._call_openai_api(prompt, max_tokens=40, temperature=0.3, module_name="TherapistEvaluator.select_initial_therapy")
         return response.rstrip('。.') if response else "cognitive-behavioral therapy"
 
     def should_use_memory(self, all_sessions_memory: Dict[str, Dict], patient_input: str) -> str:
@@ -353,7 +372,7 @@ Only when you can find places in the historical conversations that are clearly r
 Directly output your answer in English. Do not include any other analysis or explanation.
 """
     
-        response = self._call_openai_api(prompt, max_tokens=110, temperature=0.3)
+        response = self._call_openai_api(prompt, max_tokens=110, temperature=0.3, module_name="TherapistEvaluator.should_use_memory")
         return response if response else "No need to consider historical conversation memory"
     
 
@@ -368,6 +387,6 @@ Only when the patient expresses a clear intention to end (such as saying "goodby
 Strictly output a Boolean value True or False.   
 """
 
-        response = self._call_openai_api(prompt, max_tokens=5, temperature=0.0)
+        response = self._call_openai_api(prompt, max_tokens=5, temperature=0.3, module_name="TherapistEvaluator.should_end_session")
         return response.strip().lower() == "true"
 

@@ -1,16 +1,30 @@
+import sys
+import argparse
+from pathlib import Path
 import os
 from openai import OpenAI
 import json
-from typing import Dict, Any, Optional
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+# Add current directory to sys.path for relative imports
+sys.path.append(str(Path(__file__).parent))
+
+# Subdirectory prefix for all four output directories.
+# Set via --run-id before any StrictMemoryManager is instantiated for patient data.
+_RUN_ID = ""
+
 from memory import StrictMemoryManager
 from initialization import TherapistInitializer
 from evaluation import TherapistEvaluator
 import time
 from datetime import datetime
 from collections import Counter
-from typing import List, Dict, Any, Optional
 import random
 import re
+from metrics_utils import StandaloneCostTracker
 
 config = StrictMemoryManager().get_config()
 client = OpenAI(
@@ -18,16 +32,25 @@ client = OpenAI(
     api_key=config["api_config"]["openai"]["api_key"],
 )
 
+# Therapist-specific client — defaults to the same DeepSeek backend.
+# Overridden at startup when --therapist-model specifies a different LLM.
+therapist_client = client
+therapist_model = config["api_config"]["openai"]["model"]
+
 
 class PatientAgent:
-    def __init__(self, medical_record: Dict, patient_id: str):
+    def __init__(self, medical_record: Dict, patient_id: str, cost_tracker: StandaloneCostTracker = None, guidance_file: str = None, replay_attitudes: bool = False):
         self.medical_record = medical_record
         self.patient_id = patient_id
+        self.cost_tracker = cost_tracker
+        self.guidance_file = guidance_file  # None → default new_data_translate.json
+        self.replay_attitudes = replay_attitudes
+        self._label_data = self._load_label_data() if replay_attitudes else {}
         self.session_guides = self._load_session_guides()
         self.current_session_num = 1
-        self.dialogue_count = 0  
+        self.dialogue_count = 0
         self.memory_manager = StrictMemoryManager()
-        self.last_attitude = None  
+        self.last_attitude = None
 
     def _get_all_historical_dialogs(self) -> List[str]:
         all_dialogs = []
@@ -42,8 +65,21 @@ class PatientAgent:
         
         return sessions_data if sessions_data else {"session_1": {"dialogs": []}}
     
+    def _load_label_data(self) -> Dict:
+        label_dir = os.path.join("label_data", _RUN_ID) if _RUN_ID else "label_data"
+        filepath = os.path.join(label_dir, f"label_{self.patient_id}.json")
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        print(f"[WARN] No label data found for {self.patient_id} — falling back to random sampling.")
+        return {}
+
     def _load_session_guides(self) -> Dict[int, str]:
-        with open("new_data_translate.json", "r", encoding="utf-8") as f:
+        if self.guidance_file:
+            guidance_path = self.guidance_file
+        else:
+            guidance_path = Path(__file__).parent.parent / "new_data_translate.json"
+        with open(guidance_path, "r", encoding="utf-8") as f:
             all_data = json.load(f)
             patient_data = all_data.get(self.patient_id, {})
             if not patient_data:
@@ -70,8 +106,23 @@ class PatientAgent:
         historical_dialogs = self._get_all_historical_dialogs()
         client_information = self.medical_record
         session_number = self.current_session_num
-        attitude = random.choices(["positive", "negative"], weights=[70, 30])[0]
-        self.last_attitude = attitude  
+        if self.replay_attitudes:
+            session_key = f"session_{self.current_session_num}"
+            speak_key = f"speak_{self.dialogue_count}"
+            session_data = self._label_data.get(session_key, {})
+            stored_attitude = session_data.get(speak_key, {}).get("attitude")
+            if stored_attitude:
+                attitude = stored_attitude
+            elif session_data:
+                max_speak = max(int(k.split("_")[1]) for k in session_data.keys())
+                attitude = session_data[f"speak_{max_speak}"]["attitude"]
+                print(f"[WARN] {session_key}/{speak_key} beyond baseline ({max_speak} turns) — extending last attitude '{attitude}'.")
+            else:
+                print(f"[WARN] No label data for {session_key} at all — sampling randomly.")
+                attitude = random.choices(["positive", "negative"], weights=[70, 30])[0]
+        else:
+            attitude = random.choices(["positive", "negative"], weights=[70, 30])[0]
+        self.last_attitude = attitude
         dialogue_count = self.dialogue_count
 
         prompt = f"""
@@ -100,14 +151,17 @@ Strictly return a JSON object, like this:
 """
         import time
         
+        gen_config = config.get("api_config", {}).get("profiles", {}).get("generation", {"temperature": 0.7, "top_p": 1.0})
+        
         completion = client.chat.completions.create(
-            model="Pro/deepseek-ai/DeepSeek-V3",
+            model=config["api_config"]["openai"]["model"],
             messages=[
                 {"role": "system", "content": "You are a patient receiving psychological counseling."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.7,
+            temperature=gen_config.get("temperature", 0.7),
+            top_p=gen_config.get("top_p", 1.0),
             max_tokens=300
         )
 
@@ -115,6 +169,15 @@ Strictly return a JSON object, like this:
         cleaned_response = re.sub(r'^\s*```(json)?|```\s*$', '', raw_response, flags=re.IGNORECASE).strip()
         response = json.loads(cleaned_response)
         response["attitude"] = attitude  
+
+        if self.cost_tracker and completion.usage:
+            self.cost_tracker.record_call(
+                agent_name="TheraMindPatient",
+                prompt=prompt,
+                response_text=response["patient_response"],
+                usage_metadata=completion.usage.dict(),
+                model_name=config["api_config"]["openai"]["model"]
+            )
 
         self._save_label_data(
             session_num=self.current_session_num,
@@ -128,7 +191,7 @@ Strictly return a JSON object, like this:
         }  
             
     def _save_label_data(self, session_num: int, speak_num: int, attitude: str):
-        label_dir = "label_data"
+        label_dir = os.path.join("label_data", _RUN_ID) if _RUN_ID else "label_data"
         os.makedirs(label_dir, exist_ok=True)
         filename = f"label_{self.patient_id}.json"
         filepath = os.path.join(label_dir, filename)
@@ -153,10 +216,11 @@ Strictly return a JSON object, like this:
 
 
 class TherapistAgent:
-    def __init__(self):
-        self.memory_manager = StrictMemoryManager()  
-        self.initializer = TherapistInitializer(self.memory_manager)
-        self.evaluator = TherapistEvaluator(self.memory_manager)
+    def __init__(self, cost_tracker: StandaloneCostTracker = None, records_file: str = None):
+        self.memory_manager = StrictMemoryManager()
+        self.cost_tracker = cost_tracker
+        self.initializer = TherapistInitializer(self.memory_manager, records_file=records_file)
+        self.evaluator = TherapistEvaluator(self.memory_manager, cost_tracker=cost_tracker)
         self.current_session_id = None
         self.current_patient_id = None
         self.dialog_count = 0  
@@ -189,7 +253,7 @@ class TherapistAgent:
     def _end_current_session(self):
         if not hasattr(self, 'current_session_id') or not self.current_session_id:
             return
-            
+        self.last_session_turns = self.dialog_count  # save before reset (Bug 2 fix)
         self.current_session_id = None
         self.dialog_count = 0
 
@@ -199,14 +263,13 @@ class TherapistAgent:
         
         full_record = self.memory_manager.get_full_record(patient_id)
         if not full_record or not full_record.get("patient_record"):
-            initializer = TherapistInitializer(self.memory_manager)
-            medical_info = initializer._get_initial_record(patient_id)
-            
+            medical_info = self.initializer._get_initial_record(patient_id)
+
             self.memory_manager.create_patient_record(patient_id, medical_info)
             full_record = self.memory_manager.get_full_record(patient_id)  
         
         evaluation_result = self.evaluator.cross_session_evaluate(patient_id)
-        self.current_therapy = self._determine_therapy_for_new_session(patient_id)
+        self.current_therapy = evaluation_result.get("new_therapy", "") or self._determine_therapy_for_new_session(patient_id)
         
         session_num = self.memory_manager.add_session(patient_id, self.current_therapy)
         self.current_session_id = f"{patient_id}_{session_num}"
@@ -292,6 +355,31 @@ class TherapistAgent:
             "strategy": strategy_result.get("strategy", ""),
             "strategy_text": strategy_result.get("strategy_text", "")
         }
+
+        # --- Module Output Tracking (Console & File) ---
+        log_dir = os.path.join("module_logs", _RUN_ID) if _RUN_ID else "module_logs"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"trace_{self.current_patient_id}.txt")
+        
+        log_entry = (
+            f"\n[MODULE TRACKING] Session {session_num} | Round {self.dialog_count}\n"
+            f"  > [EMOTION]: {emotion_data['primary_emotion']} (Intensity: {emotion_data['emotional_intensity']})\n"
+            f"  > [REJECTION]: {'YES' if is_rejecting else 'NO'}\n"
+            f"  > [MEMORY]: {memory_result[:150]}...\n" 
+            f"  > [STAGE]: {current_stage}\n"
+            f"  > [STRATEGY]: {strategy['strategy']}\n"
+            f"  > [STRATEGY DETAIL]: {strategy['strategy_text']}\n"
+            f"  > [THERAPY]: {self.current_therapy}\n"
+            f"  > [END SESSION?]: {'YES' if should_end else 'NO'}\n"
+            f"{'-' * 40}\n"
+        )
+        
+        # Print to console
+        print(log_entry)
+        
+        # Save to file
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(log_entry)
 
         response = self._generate_response(
             patient_input=patient_text,
@@ -402,19 +490,31 @@ Your job is to respond to the patient compassionately and offer support in psych
 Directly generate your response in English. Your response should be no more than 60 words. Do not provide any word count, analysis or explanation. 
 """
 
+        gen_config = config.get("api_config", {}).get("profiles", {}).get("generation", {"temperature": 0.7, "top_p": 1.0})
+        
         try:
-            completion = client.chat.completions.create(
-                model="Pro/deepseek-ai/DeepSeek-V3",
+            completion = therapist_client.chat.completions.create(
+                model=therapist_model,
                 messages=[
                     {"role": "system", "content": "You are a experienced and empathetic psychological counselor. "},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.7,
-                max_tokens=150
+                temperature=gen_config.get("temperature", 0.7),
+                top_p=gen_config.get("top_p", 1.0),
+                max_tokens=4096
             )
             raw_response = completion.choices[0].message.content
             clean_response = raw_response.replace('\\"', '"')
             clean_response = clean_response.strip('"')
+
+            if self.cost_tracker and completion.usage:
+                self.cost_tracker.record_call(
+                    agent_name="TheraMindTherapist",
+                    prompt=prompt,
+                    response_text=clean_response,
+                    usage_metadata=completion.usage.dict(),
+                    model_name=therapist_model
+                )
         
             return clean_response
         except Exception as e:
@@ -422,44 +522,142 @@ Directly generate your response in English. Your response should be no more than
         
 
 class AutoDialogueRunner:
-    def __init__(self):
-        self.agent = TherapistAgent()
+    def __init__(self, guidance_file: str = None, records_file: str = None, fix_seed: bool = False, replay_attitudes: bool = False):
+        self.guidance_file = guidance_file
+        self.records_file = records_file
+        self.fix_seed = fix_seed
+        self.replay_attitudes = replay_attitudes
+        self.tracker = StandaloneCostTracker(model_condition="theramind_standalone")
+        self.agent = TherapistAgent(cost_tracker=self.tracker, records_file=records_file)
         self.patient_records = self._load_all_patient_records()
-    
+
     def _load_all_patient_records(self) -> Dict[str, Dict]:
-        initializer = TherapistInitializer(StrictMemoryManager())
+        initializer = TherapistInitializer(StrictMemoryManager(), records_file=self.records_file)
         all_records = initializer._load_client_record()
         return {
             pid: initializer._get_initial_record(pid)
             for pid in all_records.keys()
         }
     
-    def run(self, num_sessions=6, max_rounds_per_session=8):
+    def run(self, num_sessions=6, max_rounds_per_session=8, patient_ids: List[str] = None):
         print("\n" + "="*60)
         print("Psychological counseling conversation simulation system".center(40))
         print("="*60 + "\n")
         
-        for patient_id, medical_record in self.patient_records.items():
+        target_patients = patient_ids if patient_ids else self.patient_records.keys()
+        
+        for patient_id in target_patients:
+            if patient_id not in self.patient_records:
+                print(f"[WARNING] patient_id {patient_id} not found in records.")
+                continue
+
+            if self.fix_seed:
+                random.seed(patient_id)
+
+            medical_record = self.patient_records[patient_id]
             print(f"\n[SYSTEM] Start the consultation with {patient_id}.")
-            
+
             patient_agent = PatientAgent(
                 medical_record=medical_record,
-                patient_id=patient_id
+                patient_id=patient_id,
+                cost_tracker=self.tracker,
+                guidance_file=self.guidance_file,
+                replay_attitudes=self.replay_attitudes
             )
             
             for session_num in range(1, num_sessions+1):
+                # Resume protection: skip sessions that already have dialogs (Bug 5 fix)
+                full_record = self.agent.memory_manager.get_full_record(patient_id)
+                existing_dialogs = (full_record.get("sessions", {})
+                                    .get(f"session_{session_num}", {})
+                                    .get("dialogs", []))
+                if existing_dialogs:
+                    print(f"[SKIP] {patient_id} session {session_num} already completed ({len(existing_dialogs)} turns). Skipping.")
+                    patient_agent.update_session(session_num)
+                    continue
+
                 print(f"\n[SYSTEM] Session {session_num} begins.")
                 patient_agent.update_session(session_num)
-                
+
                 self.agent.auto_conversation(
                     patient_id=patient_id,
                     medical_record=medical_record,
-                    patient_agent=patient_agent,  
+                    patient_agent=patient_agent,
                     max_rounds=max_rounds_per_session
                 )
                 print(f"[SYSTEM] Session {session_num} ends.")
+
+                # Save cost report using last_session_turns (Bug 2 fix)
+                final_turns = getattr(self.agent, 'last_session_turns', 0)
+                self.tracker.save_report(patient_id, session_num, final_turns)
+                self.tracker.reset()
+                
                 time.sleep(1)
 
 if __name__ == "__main__":
-    simulator = AutoDialogueRunner()
-    simulator.run(num_sessions=6, max_rounds_per_session=8)
+    parser = argparse.ArgumentParser(description="TheraMind dialogue simulation.")
+    parser.add_argument("--sessions",         type=int,   default=6,    help="Number of sessions per patient (default: 6)")
+    parser.add_argument("--rounds",           type=int,   default=8,    help="Max rounds per session (default: 8)")
+    parser.add_argument("--patients",         nargs="+",  default=None, help="Patient IDs to run (default: all)")
+    parser.add_argument("--guidance",         default=None,             help="Path to guidance JSON (default: new_data_translate.json)")
+    parser.add_argument("--records",          default=None,             help="Path to client records JSON (default: client_records_translate.json)")
+    parser.add_argument("--fix-seed",         action="store_true",      help="Seed RNG with patient_id before each patient for reproducible attitude sampling")
+    parser.add_argument("--replay-attitudes", action="store_true",      help="Replay attitudes from label_data/ instead of sampling (use after baseline run)")
+    parser.add_argument("--workers",          type=int,   default=1,    help="Number of parallel patient workers (default: 1 = sequential)")
+    parser.add_argument("--therapist-model",  default=None,             help="Override therapist LLM (e.g. gemini-2.0-flash). Patient stays on DeepSeek.")
+    parser.add_argument("--run-id",           default="",               help="Subdirectory prefix for all output dirs (save_data, eval_data, label_data, module_logs). Prevents overwriting existing runs.")
+    args = parser.parse_args()
+
+    if args.run_id:
+        import memory as _memory_mod
+        _RUN_ID = args.run_id
+        _memory_mod._RUN_ID = args.run_id
+
+    if args.therapist_model:
+        import os as _os
+        _model = args.therapist_model
+        if "gemini" in _model:
+            _api_key = _os.environ.get("GEMINI_API_KEY") or _os.environ.get("GOOGLE_API_KEY", "")
+            _base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        else:
+            _api_key = config["api_config"]["openai"]["api_key"]
+            _base_url = config["api_config"]["openai"]["base_url"]
+        therapist_client = OpenAI(base_url=_base_url, api_key=_api_key)
+        therapist_model = _model
+        print(f"[Therapist] Backend overridden -> model={therapist_model}, base_url={_base_url}")
+
+    def _make_runner():
+        return AutoDialogueRunner(
+            guidance_file=args.guidance,
+            records_file=args.records,
+            fix_seed=args.fix_seed,
+            replay_attitudes=args.replay_attitudes,
+        )
+
+    if args.workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Resolve full patient list once before spawning threads
+        bootstrap = _make_runner()
+        all_patient_ids = args.patients if args.patients else list(bootstrap.patient_records.keys())
+        print(f"[SYSTEM] Running {len(all_patient_ids)} patients with {args.workers} parallel workers.")
+
+        def _run_one(pid):
+            runner = _make_runner()
+            runner.run(
+                num_sessions=args.sessions,
+                max_rounds_per_session=args.rounds,
+                patient_ids=[pid],
+            )
+
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(_run_one, pid): pid for pid in all_patient_ids}
+            for future in as_completed(futures):
+                pid = futures[future]
+                exc = future.exception()
+                if exc:
+                    print(f"[ERROR] {pid} raised an exception: {exc}")
+                else:
+                    print(f"[DONE] {pid} completed.")
+    else:
+        simulator = _make_runner()
+        simulator.run(num_sessions=args.sessions, max_rounds_per_session=args.rounds, patient_ids=args.patients)

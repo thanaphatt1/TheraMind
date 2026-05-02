@@ -4,18 +4,19 @@ import json
 from datetime import datetime
 
 class TherapistInitializer:
-    def __init__(self, memory_manager):
+    def __init__(self, memory_manager, records_file: str = None):
         self.memory_manager = memory_manager
         self.config = self._load_config()
+        # Default to original file; override for CPsyCounR or other datasets
+        self.records_file = records_file or str(Path(__file__).parent / "client_records_translate.json")
 
     def _load_config(self) -> Dict:
         config_path = Path(__file__).parent / "api_config.json"
         with open(config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
-            
+
     def _load_client_record(self, patient_id: str = None) -> Dict:
-        record_path = Path(__file__).parent / "client_records_translate.json"
-        with open(record_path, 'r', encoding='utf-8') as f:
+        with open(self.records_file, 'r', encoding='utf-8') as f:
             all_records = json.load(f)
             if patient_id:
                 return all_records.get(patient_id, {})

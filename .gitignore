@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Secrets
+agent/api_config.json
+
+# Logs and Data
+module_logs/
+save_data/
+eval_results/
+eval_data/
+label_data/
+simulation_log.txt
+tmp_inspect.txt
+*.log
+
+# Workspace
+.vscode/
+*.code-workspace
+
+# Large JSON files (checkpoints and generated data)
+*_checkpoint.json
+cpsy_*.json
+new_data_translate.json
+raw_data_translate.json
+client_records_translate.json
+TheraMind_Patient_Guidance.json
+CPsyCounR.json
+classified_cpsy*.json

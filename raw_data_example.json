@@ -1,0 +1,20 @@
+[
+  {
+    "patient_001": {
+      "case title": "Example Case: Depression and Anxiety",
+      "case category": "Depressive Disorder",
+      "case summary": "Patient reports persistent low mood, loss of interest in hobbies, and occasional panic attacks over the last 6 months.",
+      "case description": "The patient is a 28-year-old individual who has been experiencing significant distress in social situations and a lack of motivation at work. They describe feeling 'stuck' in a cycle of negative thoughts.",
+      "consultation process": "Session 1: Intake and assessment. Session 2: Identifying cognitive distortions. Session 3: Introduction to Behavioral Activation. Session 4: Relapse prevention and wrap-up."
+    }
+  },
+  {
+    "patient_002": {
+      "case title": "Example Case: Relationship Stress",
+      "case category": "Interpersonal Problems",
+      "case summary": "Client is struggling with communication issues in their long-term partnership, leading to frequent arguments.",
+      "case description": "The client expresses frustration over their partner's perceived emotional unavailability. They seek tools for better conflict resolution and emotional expression.",
+      "consultation process": "Session 1: Understanding relationship dynamics. Session 2: Communication skill building. Session 3: Boundary setting. Session 4: Re-evaluating partnership goals."
+    }
+  }
+]
