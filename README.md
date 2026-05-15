@@ -80,11 +80,12 @@ patient_agent = PatientAgent()
 
 ## 📜 Citation
 ```bibtex
-@article{hu2025theramind,
+@inproceedings{hu2026theramind,
   title={Theramind: A strategic and adaptive agent for longitudinal psychological counseling},
-  author={Hu, He and Zhou, Yucheng and Ma, Chiyuan and Wang, Qianning and Zhang, Zheng and Ma, Fei and Cui, Laizhong and Tian, Qi},
-  journal={arXiv preprint arXiv:2510.25758},
-  year={2025}
+  author={Hu, He and Ma, Chiyuan and Wang, Qianning and Lin, Liu and Zhou, Yucheng and Cui, Laizhong and Ma, Fei and Tian, Qi},
+  booktitle={Proceedings of the ACM Web Conference 2026},
+  pages={9136--9147},
+  year={2026}
 }
 ```
 
