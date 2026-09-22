@@ -21,7 +21,7 @@ class StrictMemoryManager:
 
     def get_evaluator(self):
         if self._evaluator is None:
-            from evaluation import TherapistEvaluator
+            from tm_evaluation import TherapistEvaluator
             self._evaluator = TherapistEvaluator(self)
         return self._evaluator
    

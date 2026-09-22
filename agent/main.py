@@ -1,3 +1,4 @@
+import ast
 import sys
 import argparse
 from pathlib import Path
@@ -6,6 +7,28 @@ from openai import OpenAI
 import json
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
+import time
+from datetime import datetime
+from collections import Counter
+import random
+import re
+from metrics_utils import StandaloneCostTracker
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Safely convert a value to float, stripping non-numeric characters if needed."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        # Try to extract the first number found in the string
+        match = re.search(r"[-+]?\d*\.\d+|\d+", value)
+        if match:
+            try:
+                return float(match.group())
+            except ValueError:
+                pass
+    return default
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -18,7 +41,7 @@ _RUN_ID = ""
 
 from memory import StrictMemoryManager
 from initialization import TherapistInitializer
-from evaluation import TherapistEvaluator
+from tm_evaluation import TherapistEvaluator
 import time
 from datetime import datetime
 from collections import Counter
@@ -165,9 +188,17 @@ Strictly return a JSON object, like this:
             max_tokens=300
         )
 
-        raw_response = completion.choices[0].message.content
+        raw_response = completion.choices[0].message.content or ""
         cleaned_response = re.sub(r'^\s*```(json)?|```\s*$', '', raw_response, flags=re.IGNORECASE).strip()
-        response = json.loads(cleaned_response)
+        # Robust parse: handles single-quoted dicts from Gemini
+        try:
+            response = json.loads(cleaned_response)
+        except json.JSONDecodeError:
+            try:
+                response = ast.literal_eval(cleaned_response)
+            except (ValueError, SyntaxError):
+                normalised = cleaned_response.replace("'", '"').replace("True", "true").replace("False", "false")
+                response = json.loads(normalised)
         response["attitude"] = attitude  
 
         if self.cost_tracker and completion.usage:
@@ -221,6 +252,7 @@ class TherapistAgent:
         self.cost_tracker = cost_tracker
         self.initializer = TherapistInitializer(self.memory_manager, records_file=records_file)
         self.evaluator = TherapistEvaluator(self.memory_manager, cost_tracker=cost_tracker)
+        self.memory_manager._evaluator = self.evaluator
         self.current_session_id = None
         self.current_patient_id = None
         self.dialog_count = 0  
@@ -334,8 +366,8 @@ class TherapistAgent:
             emotion_result = {}
         emotion_data = {
             "primary_emotion": emotion_result.get("primary_emotion", ""),
-            "emotional_intensity": float(emotion_result.get("emotional_intensity", 0.0))
-        }       
+            "emotional_intensity": _safe_float(emotion_result.get("emotional_intensity", 0.0))
+        }
         
         full_record = self.memory_manager.get_full_record(self.current_patient_id)
         memory_result = self.evaluator.should_use_memory(
@@ -384,7 +416,11 @@ class TherapistAgent:
         response = self._generate_response(
             patient_input=patient_text,
             emotion_data=emotion_data,
-            current_therapy=self.current_therapy
+            current_therapy=self.current_therapy,
+            is_rejecting=is_rejecting,
+            strategy_result=strategy_result,
+            memory_result=memory_result,
+            current_stage=current_stage,
         )
         
         self.memory_manager.add_dialog(
@@ -432,12 +468,16 @@ class TherapistAgent:
         return session.get("therapy", "unspecified therapy")
     
 
-    def _generate_response(self, 
-                     patient_input: str,   
+    def _generate_response(self,
+                     patient_input: str,
                      emotion_data: Dict[str, Any],
-                     current_therapy: str) -> str:
+                     current_therapy: str,
+                     is_rejecting: bool = None,
+                     strategy_result: Dict[str, Any] = None,
+                     memory_result: str = None,
+                     current_stage: str = None) -> str:
         config = self.memory_manager.get_config()
-                
+
         session_memory = {}
         if self.current_session_id:
             try:
@@ -451,23 +491,29 @@ class TherapistAgent:
             except Exception as e:
                 session_memory = {"dialogs": []}
 
-        current_stage = self.memory_manager.get_current_stage(self.current_patient_id)
-        full_record = self.memory_manager.get_full_record(self.current_patient_id)
-        memory_result = self.evaluator.should_use_memory(
-            all_sessions_memory=full_record.get("sessions", {}),
-            patient_input=patient_input
-        )
-        
+        if current_stage is None:
+            current_stage = self.memory_manager.get_current_stage(self.current_patient_id)
+
+        # Use pre-computed values from process_patient_input when available
+        if memory_result is None:
+            full_record = self.memory_manager.get_full_record(self.current_patient_id)
+            memory_result = self.evaluator.should_use_memory(
+                all_sessions_memory=full_record.get("sessions", {}),
+                patient_input=patient_input
+            )
+
         primary_emotion = emotion_data.get("primary_emotion", "unknown")
         emotional_intensity = emotion_data.get("emotional_intensity", 0.0)
-        
-        is_rejecting = self.evaluator.evaluate_client_reaction(patient_input)
-        strategy_result = self.evaluator.update_response_strategy(
-            emotion_data = emotion_data, 
-            is_rejecting = is_rejecting,
-            patient_input=patient_input,
-            patient_id=self.current_patient_id
-        )
+
+        if is_rejecting is None:
+            is_rejecting = self.evaluator.evaluate_client_reaction(patient_input)
+        if strategy_result is None:
+            strategy_result = self.evaluator.update_response_strategy(
+                emotion_data=emotion_data,
+                is_rejecting=is_rejecting,
+                patient_input=patient_input,
+                patient_id=self.current_patient_id
+            )
         
         current_strategy = strategy_result.get('strategy', '')
         current_strategy_text = strategy_result.get('strategy_text', '')
@@ -486,8 +532,9 @@ Your job is to respond to the patient compassionately and offer support in psych
   7.Don't always directly repeat or quote what the patient has said. Just empathize the patient with as little words as possible. Ensure the smooth of the conversation.
   8.You must use diverse and different sentence patterns to reply each time to avoid a single reply mode. To avoid using the same sentence pattern, please refer to your previous replies from the conversation records for this session:{session_memory}.
   9.When the patient expresses a clear desire to end this conversation, please also provide a response to end the conversation in a declarative tone.
+  10.When you believe the counseling session has reached a natural conclusion (patient has made a clear commitment, expressed meaningful resolution, or said farewell), append the exact token [/END] at the very end of your response.
 ##Constraints:
-Directly generate your response in English. Your response should be no more than 60 words. Do not provide any word count, analysis or explanation. 
+Directly generate your response in English. Your response should be no more than 60 words. Do not provide any word count, analysis or explanation.
 """
 
         gen_config = config.get("api_config", {}).get("profiles", {}).get("generation", {"temperature": 0.7, "top_p": 1.0})
