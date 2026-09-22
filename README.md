@@ -9,6 +9,15 @@ This repository contains the official evaluation code and data for the paper "**
 
 > TheraMind represents a definitive shift in AI mental health, moving beyond static models to a dynamic, longitudinal agent that emulates human cognitive processes. It features a novel dual-loop framework that manages both immediate turn-by-turn interactions and long-term strategic goals across multiple sessions. Unlike traditional single-therapy tools, TheraMind utilizes an adaptive selection mechanism to adjust its clinical approach based on real-time efficacy. By integrating patient state perception with phase-aware dialogue management, it transforms standard response generation into a deliberative clinical intervention.
 
+## 📌 Note on This Fork
+This repository is a maintained fork of [Emo-gml/TheraMind](https://github.com/Emo-gml/TheraMind). It includes several bug fixes, architectural improvements, and multi-model robustness patches:
+- **Strategy Memory Bug Fix**: Resolves an upstream off-by-one indexing error and hardcoded path in `TherapistEvaluator._get_session_strategy_memory`, restoring the agent's ability to retrieve prior within-session strategies and activate the strategy diversity prompt.
+- **Namespace Isolation**: Renamed `agent/evaluation.py` to `agent/tm_evaluation.py` to prevent import collisions with outer evaluation frameworks.
+- **Robust Parsing & Multi-Backend Support**: Added `_safe_float` and AST parsing fallbacks for diverse LLM outputs (Gemini, Claude, GPT, Ollama).
+- **Redundant Computation Bypass**: Eliminated duplicate perception evaluations between turns.
+
+👉 **See [FORK_CHANGELOG.md](FORK_CHANGELOG.md) for full technical details, diffs, and rationale.**
+
 ## 📰 News
 - **[2026-01-14]** Our paper [**TheraMind**](https://arxiv.org/abs/2510.25758) has been accepted by WWW2026 !
 - **[2025-11-02]** Paper submitted to arXiv:https://arxiv.org/abs/2510.25758.
